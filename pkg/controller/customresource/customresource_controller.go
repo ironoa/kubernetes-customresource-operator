@@ -3,6 +3,7 @@ package customresource
 import (
 	"context"
 
+	"github.com/go-logr/logr"
 	cachev1alpha1 "github.com/ironoa/kubernetes-customresource-operator/pkg/apis/cache/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -78,119 +79,113 @@ type ReconcileCustomResource struct {
 
 // Reconcile reads that state of the cluster for a CustomResource object and makes changes based on the state read
 // and what is in the CustomResource.Spec
-// TODO(user): Modify this Reconcile function to implement your Controller logic.  This example creates
-// a Pod as an example
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCustomResource) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
-	reqLogger.Info("Reconciling CustomResource")
+	logger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
+	logger.Info("Reconciling CustomResource")
 
-	// Fetch the CustomResource instance
-	instance := &cachev1alpha1.CustomResource{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	instance, err := r.fetchCustomResource(request)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
+			logger.Info("Custom Resource not found... Return and not requeing the request")
 			return reconcile.Result{}, nil
 		}
-		// Error reading the object - requeue the request.
+		logger.Error(err, "Error on fetch the Custom Resource... Requeing the Reconciling request... ")
 		return reconcile.Result{}, err
 	}
 
-	/*
-		// Define a new Pod object
-		pod := newPodForCR(instance)
-
-		// Set CustomResource instance as the owner and controller
-		if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-			return reconcile.Result{}, err
+	err = r.handleDeployment(instance)
+	if err != nil {
+		logger.Info("Requeing the Reconciling request... ")
+		if errors.IsNotFound(err) {
+			return reconcile.Result{Requeue: true}, nil
 		}
-
-		// Check if this Pod already exists
-		found := &corev1.Pod{}
-		err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
-		if err != nil && errors.IsNotFound(err) {
-			reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-			err = r.client.Create(context.TODO(), pod)
-			if err != nil {
-				return reconcile.Result{}, err
-			}
-
-			// Pod created successfully - don't requeue
-			return reconcile.Result{}, nil
-		} else if err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// Pod already exists - don't requeue
-		reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
-		return reconcile.Result{}, nil
-	*/
-
-	// Define a new Deployment object
-	deployment := r.newDeploymentForCR(instance)
-
-	// Check if this Deployment already exists
-	found := &appsv1.Deployment{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, found)
-	if err != nil && errors.IsNotFound(err) {
-
-		// Define and create a new deployment.
-		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
-		if err = r.client.Create(context.TODO(), deployment); err != nil {
-			return reconcile.Result{}, err
-		}
-
-		// Deployment created successfully - don't requeue
-		return reconcile.Result{Requeue: true}, nil
-	} else if err != nil {
 		return reconcile.Result{}, err
-	}
-	// Deployment already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Deployment already exists", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
-
-	// Ensure the deployment size is the same as the spec.
-	size := instance.Spec.Size
-	if *found.Spec.Replicas != size {
-		found.Spec.Replicas = &size
-		if err = r.client.Update(context.TODO(), found); err != nil {
-			return reconcile.Result{}, err
-		}
-		// is this really necessary?
-		return reconcile.Result{Requeue: true}, nil
 	}
 
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *cachev1alpha1.CustomResource) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
-	}
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
-				},
-			},
-		},
-	}
+func (r *ReconcileCustomResource) fetchCustomResource(request reconcile.Request) (*cachev1alpha1.CustomResource, error) {
+	instance := &cachev1alpha1.CustomResource{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	return instance, err
 }
 
-// func newDeploymentForCR
+func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.CustomResource) error {
+	deployment := r.newDeploymentForCR(instance)
+	logger := log.WithValues("Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
+
+	foundDeployment, err := r.fetchDeployment(deployment)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "Error on fetch the Deployment...")
+			return err
+		}
+		logger.Info("Deployment not found...")
+		creationError := r.createDeployment(deployment, logger)
+		if creationError != nil {
+			logger.Error(creationError, "Error on creating a new Deployment...")
+			return creationError
+		}
+		logger.Info("Created the new Deployment")
+		return err
+	}
+
+	err = r.alignResourceSpecsAndDeployment(instance, foundDeployment, logger)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *ReconcileCustomResource) fetchDeployment(deployment *appsv1.Deployment) (*appsv1.Deployment, error) {
+	found := &appsv1.Deployment{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, found)
+	return found, err
+}
+
+func (r *ReconcileCustomResource) createDeployment(deployment *appsv1.Deployment, logger logr.Logger) error {
+	logger.Info("Creating a new Deployment...")
+	err := r.client.Create(context.TODO(), deployment)
+	return err
+}
+
+func (r *ReconcileCustomResource) alignResourceSpecsAndDeployment(instance *cachev1alpha1.CustomResource, deployment *appsv1.Deployment, logger logr.Logger) error {
+	err := r.alignDeploymentReplica(instance, deployment, logger)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *ReconcileCustomResource) alignDeploymentReplica(instance *cachev1alpha1.CustomResource, deployment *appsv1.Deployment, logger logr.Logger) error {
+	size := instance.Spec.Size
+	if *deployment.Spec.Replicas != size {
+		err := r.updateDeploymentReplica(deployment, size, logger)
+		if err != nil {
+			logger.Error(err, "Error on updating the Deployment's replicas...")
+			return err
+		}
+		logger.Info("Updated the Deployment replica size...", size)
+	}
+	return nil
+}
+
+func (r *ReconcileCustomResource) updateDeploymentReplica(deployment *appsv1.Deployment, newSize int32, logger logr.Logger) error {
+	logger.Info("Updating the Deployment replica size...")
+	deployment.Spec.Replicas = &newSize
+	err := r.client.Update(context.TODO(), deployment)
+	return err
+}
+
 func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomResource) *appsv1.Deployment {
 	labels := labelsForApp(cr.Name)
 	replicas := cr.Spec.Size
@@ -230,4 +225,27 @@ func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomRes
 // labelsForApp creates a simple set of labels for App.
 func labelsForApp(name string) map[string]string {
 	return map[string]string{"app_name": "app", "app_cr": name}
+}
+
+// newPodForCR returns a busybox pod with the same name/namespace as the cr
+func newPodForCR(cr *cachev1alpha1.CustomResource) *corev1.Pod {
+	labels := map[string]string{
+		"app": cr.Name,
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name + "-pod",
+			Namespace: cr.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    "busybox",
+					Image:   "busybox",
+					Command: []string{"sleep", "3600"},
+				},
+			},
+		},
+	}
 }
