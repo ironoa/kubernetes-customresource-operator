@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: liveness-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: liveness
+      version: "1.0"
+  template:
+    metadata:
+      labels:
+        app: liveness
+        version: "1.0"
+    spec:
+      containers:
+      - name: liveness
+        image: k8s.gcr.io/busybox
+        args:
+        - /bin/sh
+        - -c
+        - touch /tmp/healthy; sleep 30; rm -rf /tmp/healthy; sleep 600
+        livenessProbe:
+          exec:
+            command:
+            - cat
+            - /tmp/healthy
+          initialDelaySeconds: 3
+          periodSeconds: 5

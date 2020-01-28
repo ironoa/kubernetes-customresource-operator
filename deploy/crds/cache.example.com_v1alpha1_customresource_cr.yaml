@@ -4,4 +4,5 @@ metadata:
   name: example-customresource
 spec:
   # Add fields here
-  size: 6
+  size: 4
+  version: latest

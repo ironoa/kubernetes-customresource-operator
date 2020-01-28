@@ -14,7 +14,8 @@ type CustomResourceSpec struct {
 	// Add custom validation using kubebuilder tags: https://book-v1.book.kubebuilder.io/beyond_basics/generating_crd.html
 
 	// Size of the Deployment
-	Size int32 `json:"size"`
+	Size    int32  `json:"size"`
+	Version string `json:"version"`
 }
 
 // CustomResourceStatus defines the observed state of CustomResource

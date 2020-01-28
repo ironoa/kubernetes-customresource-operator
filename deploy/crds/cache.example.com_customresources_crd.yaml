@@ -35,8 +35,11 @@ spec:
               description: Size of the Deployment
               format: int32
               type: integer
+            version:
+              type: string
           required:
           - size
+          - version
           type: object
         status:
           description: CustomResourceStatus defines the observed state of CustomResource

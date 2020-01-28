@@ -118,17 +118,17 @@ func (r *ReconcileCustomResource) fetchCustomResource(request reconcile.Request)
 }
 
 func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.CustomResource) error {
-	deployment := r.newDeploymentForCR(instance)
-	logger := log.WithValues("Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
+	desideredDeployment := r.newDeploymentForCR(instance)
+	logger := log.WithValues("Deployment.Namespace", desideredDeployment.Namespace, "Deployment.Name", desideredDeployment.Name)
 
-	foundDeployment, err := r.fetchDeployment(deployment)
+	foundDeployment, err := r.fetchDeployment(desideredDeployment)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "Error on fetch the Deployment...")
 			return err
 		}
 		logger.Info("Deployment not found...")
-		creationError := r.createDeployment(deployment, logger)
+		creationError := r.createDeployment(desideredDeployment, logger)
 		if creationError != nil {
 			logger.Error(creationError, "Error on creating a new Deployment...")
 			return creationError
@@ -137,9 +137,13 @@ func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.Custo
 		return err
 	}
 
-	err = r.alignResourceSpecsAndDeployment(instance, foundDeployment, logger)
-	if err != nil {
-		return err
+	if areDeploymentsDifferent(foundDeployment, desideredDeployment, logger) {
+		err := r.updateDeployment(desideredDeployment, logger)
+		if err != nil {
+			logger.Error(err, "Update Deployment Error...")
+			return err
+		}
+		logger.Info("Updated the Deployment...")
 	}
 
 	return nil
@@ -157,43 +161,73 @@ func (r *ReconcileCustomResource) createDeployment(deployment *appsv1.Deployment
 	return err
 }
 
-func (r *ReconcileCustomResource) alignResourceSpecsAndDeployment(instance *cachev1alpha1.CustomResource, deployment *appsv1.Deployment, logger logr.Logger) error {
-	err := r.alignDeploymentReplica(instance, deployment, logger)
-	if err != nil {
-		return err
+func areDeploymentsDifferent(currentDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) bool {
+	result := false
+
+	if isDeploymentReplicaDifferent(currentDeployment, desideredDeployment, logger) {
+		result = true
+	}
+	if isDeploymentVersionDifferent(currentDeployment, desideredDeployment, logger) {
+		result = true
 	}
 
-	return nil
+	return result
 }
 
-func (r *ReconcileCustomResource) alignDeploymentReplica(instance *cachev1alpha1.CustomResource, deployment *appsv1.Deployment, logger logr.Logger) error {
-	size := instance.Spec.Size
-	if *deployment.Spec.Replicas != size {
-		err := r.updateDeploymentReplica(deployment, size, logger)
-		if err != nil {
-			logger.Error(err, "Error on updating the Deployment's replicas...")
-			return err
-		}
-		logger.Info("Updated the Deployment replica size...", size)
+/* TODO investigate, now it is not working
+func (r *ReconcileCustomResource) alignDeployments(foundDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) error {
+
+	//deep check
+	logger.Info("Comparing found and desidered....")
+	//if *foundDeployment != *desideredDeployment {
+	//	logger.Info("Found a difference: normal check")
+	//}
+
+	diff := deep.Equal(*foundDeployment, *desideredDeployment)
+	if diff != nil {
+		logger.Info("Found a difference: library check")
+		logger.Info("differences:", "Differences:", diff)
 	}
+
+	//update
+
 	return nil
+}*/
+
+func isDeploymentReplicaDifferent(currentDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) bool {
+	size := *desideredDeployment.Spec.Replicas
+	if *currentDeployment.Spec.Replicas != size {
+		logger.Info("Find a replica size mismatch...")
+		return true
+	}
+	return false
 }
 
-func (r *ReconcileCustomResource) updateDeploymentReplica(deployment *appsv1.Deployment, newSize int32, logger logr.Logger) error {
-	logger.Info("Updating the Deployment replica size...")
-	deployment.Spec.Replicas = &newSize
-	err := r.client.Update(context.TODO(), deployment)
-	return err
+func isDeploymentVersionDifferent(currentDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) bool {
+	version := desideredDeployment.ObjectMeta.Labels["version"]
+	if currentDeployment.ObjectMeta.Labels["version"] != version {
+		logger.Info("Found a version mismatch...")
+		return true
+	}
+	return false
+}
+
+func (r *ReconcileCustomResource) updateDeployment(deployment *appsv1.Deployment, logger logr.Logger) error {
+	logger.Info("Updating the Deployment...")
+	return r.client.Update(context.TODO(), deployment)
 }
 
 func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomResource) *appsv1.Deployment {
-	labels := labelsForApp(cr.Name)
+	labels := labelsForApp(cr)
 	replicas := cr.Spec.Size
+	version := cr.Spec.Version
+	labelsWithVersion := labelsForAppWithVersion(cr, version)
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cr.Name + "-deployment",
 			Namespace: cr.Namespace,
+			Labels:    labelsWithVersion,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -207,7 +241,7 @@ func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomRes
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
 						Name:    "busybox",
-						Image:   "busybox",
+						Image:   "busybox:" + version,
 						Command: []string{"sleep", "3600"},
 					}},
 				},
@@ -222,9 +256,63 @@ func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomRes
 	return deployment
 }
 
+func (r *ReconcileCustomResource) newDeploymentForCRLivenessTest(cr *cachev1alpha1.CustomResource) *appsv1.Deployment {
+	labels := labelsForApp(cr)
+	replicas := cr.Spec.Size
+	version := cr.Spec.Version
+	labelsWithVersion := labelsForAppWithVersion(cr, version)
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name + "-deployment",
+			Namespace: cr.Namespace,
+			Labels:    labelsWithVersion,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "busybox-liveness",
+						Image: "k8s.gcr.io/busybox:" + cr.Spec.Version,
+						Args:  []string{"/bin/sh", "-c", "touch /tmp/healthy; sleep 30; rm -rf /tmp/healthy; sleep 600"},
+						LivenessProbe: &corev1.Probe{
+							Handler: corev1.Handler{
+								Exec: &corev1.ExecAction{
+									Command: []string{"cat", "/tmp/healthy"},
+								},
+							},
+							InitialDelaySeconds: 3,
+							PeriodSeconds:       5,
+						},
+					}},
+				},
+			},
+		},
+	}
+
+	// Set App instance as the owner and controller.
+	// NOTE: calling SetControllerReference, and setting owner references in
+	// general, is important as it allows deleted objects to be garbage collected.
+	controllerutil.SetControllerReference(cr, deployment, r.scheme)
+	return deployment
+}
+
 // labelsForApp creates a simple set of labels for App.
-func labelsForApp(name string) map[string]string {
-	return map[string]string{"app_name": "app", "app_cr": name}
+func labelsForApp(cr *cachev1alpha1.CustomResource) map[string]string {
+	return map[string]string{"app_name": "app", "app_cr": cr.Name}
+}
+
+func labelsForAppWithVersion(cr *cachev1alpha1.CustomResource, version string) map[string]string {
+	labels := labelsForApp(cr)
+	labels["version"] = version
+	return labels
 }
 
 // newPodForCR returns a busybox pod with the same name/namespace as the cr
