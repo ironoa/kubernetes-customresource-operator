@@ -86,72 +86,100 @@ func (r *ReconcileCustomResource) Reconcile(request reconcile.Request) (reconcil
 	logger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	logger.Info("Reconciling CustomResource")
 
-	instance, err := r.fetchCustomResource(request)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
-			logger.Info("Custom Resource not found... Return and not requeing the request")
-			return reconcile.Result{}, nil
-		}
-		logger.Error(err, "Error on fetch the Custom Resource... Requeing the Reconciling request... ")
-		return reconcile.Result{}, err
-	}
-
-	err = r.handleDeployment(instance)
+	instance, err := r.handleCustomResource(request)
 	if err != nil {
 		logger.Info("Requeing the Reconciling request... ")
-		if errors.IsNotFound(err) {
-			return reconcile.Result{Requeue: true}, nil
-		}
 		return reconcile.Result{}, err
 	}
+	if instance == nil {
+		logger.Info("Return and not requeing the request")
+		return reconcile.Result{}, nil
+	}
+
+	isRequeueForced, err := r.handleDeployment(instance)
+	if err != nil {
+		logger.Info("Requeing the Reconciling request... ")
+		return reconcile.Result{}, err
+	}
+	if isRequeueForced {
+		logger.Info("Requeing the Reconciling request... ")
+		return reconcile.Result{Requeue: true}, nil
+	}
+
+	// more handlers
 
 	return reconcile.Result{}, nil
 }
 
-func (r *ReconcileCustomResource) fetchCustomResource(request reconcile.Request) (*cachev1alpha1.CustomResource, error) {
-	instance := &cachev1alpha1.CustomResource{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
-	return instance, err
+func (r *ReconcileCustomResource) handleCustomResource(request reconcile.Request) (*cachev1alpha1.CustomResource, error) {
+	logger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
+
+	instance, err := r.fetchCustomResource(request)
+	if err != nil {
+		logger.Error(err, "Error on fetch the Custom Resource...")
+		return nil, err
+	}
+	if instance == nil {
+		logger.Info("Custom Resource not found...")
+		return nil, nil
+	}
+
+	return instance, nil
 }
 
-func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.CustomResource) error {
+func (r *ReconcileCustomResource) fetchCustomResource(request reconcile.Request) (*cachev1alpha1.CustomResource, error) {
+	found := &cachev1alpha1.CustomResource{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, found)
+	if err != nil && errors.IsNotFound(err) {
+		// Request object not found, could have been deleted after reconcile request.
+		// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
+		// Return and don't requeue
+		return nil, nil
+	}
+	return found, err
+}
+
+func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.CustomResource) (bool, error) {
+	const NotForcedRequeue = false
+	const ForcedRequeue = true
+
 	desideredDeployment := r.newDeploymentForCR(instance)
 	logger := log.WithValues("Deployment.Namespace", desideredDeployment.Namespace, "Deployment.Name", desideredDeployment.Name)
 
 	foundDeployment, err := r.fetchDeployment(desideredDeployment)
 	if err != nil {
-		if !errors.IsNotFound(err) {
-			logger.Error(err, "Error on fetch the Deployment...")
-			return err
-		}
+		logger.Error(err, "Error on fetch the Deployment...")
+		return NotForcedRequeue, err
+	}
+	if foundDeployment == nil {
 		logger.Info("Deployment not found...")
-		creationError := r.createDeployment(desideredDeployment, logger)
-		if creationError != nil {
-			logger.Error(creationError, "Error on creating a new Deployment...")
-			return creationError
+		err := r.createDeployment(desideredDeployment, logger)
+		if err != nil {
+			logger.Error(err, "Error on creating a new Deployment...")
+			return NotForcedRequeue, err
 		}
 		logger.Info("Created the new Deployment")
-		return err
+		return ForcedRequeue, nil
 	}
 
 	if areDeploymentsDifferent(foundDeployment, desideredDeployment, logger) {
 		err := r.updateDeployment(desideredDeployment, logger)
 		if err != nil {
 			logger.Error(err, "Update Deployment Error...")
-			return err
+			return NotForcedRequeue, err
 		}
 		logger.Info("Updated the Deployment...")
 	}
 
-	return nil
+	return NotForcedRequeue, nil
 }
 
 func (r *ReconcileCustomResource) fetchDeployment(deployment *appsv1.Deployment) (*appsv1.Deployment, error) {
 	found := &appsv1.Deployment{}
 	err := r.client.Get(context.TODO(), types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, found)
+	if err != nil && errors.IsNotFound(err) {
+		return nil, nil
+	}
 	return found, err
 }
 
