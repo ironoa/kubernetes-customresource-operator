@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -105,6 +106,14 @@ func (r *ReconcileCustomResource) Reconcile(request reconcile.Request) (reconcil
 		logger.Info("Requeing the Reconciling request... ")
 		return reconcile.Result{Requeue: true}, nil
 	}
+
+	/*
+		_, err = r.handleService(instance)
+		if err != nil {
+			logger.Info("Requeing the Reconciling request... ")
+			return reconcile.Result{}, err
+		}
+	*/
 
 	// more handlers
 
@@ -202,26 +211,6 @@ func areDeploymentsDifferent(currentDeployment *appsv1.Deployment, desideredDepl
 	return result
 }
 
-/* TODO investigate, now it is not working
-func (r *ReconcileCustomResource) alignDeployments(foundDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) error {
-
-	//deep check
-	logger.Info("Comparing found and desidered....")
-	//if *foundDeployment != *desideredDeployment {
-	//	logger.Info("Found a difference: normal check")
-	//}
-
-	diff := deep.Equal(*foundDeployment, *desideredDeployment)
-	if diff != nil {
-		logger.Info("Found a difference: library check")
-		logger.Info("differences:", "Differences:", diff)
-	}
-
-	//update
-
-	return nil
-}*/
-
 func isDeploymentReplicaDifferent(currentDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) bool {
 	size := *desideredDeployment.Spec.Replicas
 	if *currentDeployment.Spec.Replicas != size {
@@ -243,6 +232,34 @@ func isDeploymentVersionDifferent(currentDeployment *appsv1.Deployment, desidere
 func (r *ReconcileCustomResource) updateDeployment(deployment *appsv1.Deployment, logger logr.Logger) error {
 	logger.Info("Updating the Deployment...")
 	return r.client.Update(context.TODO(), deployment)
+}
+
+func (r *ReconcileCustomResource) handleService(instance *cachev1alpha1.CustomResource) (*corev1.Service, error) {
+	reqLogger := log.WithValues("Request.Namespace", instance.Namespace, "Request.Name", instance.Name)
+
+	// Define a new Service object
+	service := newServiceForCR(instance)
+
+	// Set FactorioServer instance as the owner and controller
+	if err := controllerutil.SetControllerReference(instance, service, r.scheme); err != nil {
+		return nil, err
+	}
+
+	// Check if the Service already exists
+	found := &corev1.Service{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, found)
+	if err == nil {
+		// Service already exists - don't requeue
+		reqLogger.Info("Skip reconcile: Service already exists", "Service.Namespace", found.Namespace, "Service.Name", found.Name)
+		return found, nil
+	} else if err != nil && errors.IsNotFound(err) {
+		reqLogger.Info("Creating a new Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
+		if err := r.client.Create(context.TODO(), service); err != nil {
+			return nil, err
+		}
+		return service, nil
+	}
+	return nil, err
 }
 
 func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomResource) *appsv1.Deployment {
@@ -268,56 +285,18 @@ func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomRes
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:    "busybox",
-						Image:   "busybox:" + version,
-						Command: []string{"sleep", "3600"},
-					}},
-				},
-			},
-		},
-	}
-
-	// Set App instance as the owner and controller.
-	// NOTE: calling SetControllerReference, and setting owner references in
-	// general, is important as it allows deleted objects to be garbage collected.
-	controllerutil.SetControllerReference(cr, deployment, r.scheme)
-	return deployment
-}
-
-func (r *ReconcileCustomResource) newDeploymentForCRLivenessTest(cr *cachev1alpha1.CustomResource) *appsv1.Deployment {
-	labels := labelsForApp(cr)
-	replicas := cr.Spec.Size
-	version := cr.Spec.Version
-	labelsWithVersion := labelsForAppWithVersion(cr, version)
-
-	deployment := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-deployment",
-			Namespace: cr.Namespace,
-			Labels:    labelsWithVersion,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Name:  "busybox-liveness",
-						Image: "k8s.gcr.io/busybox:" + cr.Spec.Version,
-						Args:  []string{"/bin/sh", "-c", "touch /tmp/healthy; sleep 30; rm -rf /tmp/healthy; sleep 600"},
-						LivenessProbe: &corev1.Probe{
-							Handler: corev1.Handler{
-								Exec: &corev1.ExecAction{
-									Command: []string{"cat", "/tmp/healthy"},
-								},
+						Name:  "polkadot",
+						Image: "chevdor/polkadot:" + version,
+						Ports: []corev1.ContainerPort{
+							{
+								ContainerPort: 30333,
 							},
-							InitialDelaySeconds: 3,
-							PeriodSeconds:       5,
+							{
+								ContainerPort: 9933,
+							},
+							{
+								ContainerPort: 9944,
+							},
 						},
 					}},
 				},
@@ -332,9 +311,44 @@ func (r *ReconcileCustomResource) newDeploymentForCRLivenessTest(cr *cachev1alph
 	return deployment
 }
 
+func newServiceForCR(cr *cachev1alpha1.CustomResource) *corev1.Service {
+	labels := labelsForApp(cr)
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name,
+			Namespace: cr.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "a",
+					Port:       30333,
+					TargetPort: intstr.FromInt(30333),
+					Protocol:   "TCP",
+				},
+				{
+					Name:       "b",
+					Port:       9933,
+					TargetPort: intstr.FromInt(9933),
+					Protocol:   "TCP",
+				},
+				{
+					Name:       "c",
+					Port:       9944,
+					TargetPort: intstr.FromInt(9944),
+					Protocol:   "TCP",
+				},
+			},
+			Selector: labels,
+		},
+	}
+}
+
 // labelsForApp creates a simple set of labels for App.
 func labelsForApp(cr *cachev1alpha1.CustomResource) map[string]string {
-	return map[string]string{"app_name": "app", "app_cr": cr.Name}
+	return map[string]string{"app": cr.Name, "app_cr": cr.Name}
 }
 
 func labelsForAppWithVersion(cr *cachev1alpha1.CustomResource, version string) map[string]string {
@@ -343,25 +357,19 @@ func labelsForAppWithVersion(cr *cachev1alpha1.CustomResource, version string) m
 	return labels
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *cachev1alpha1.CustomResource) *corev1.Pod {
+func matchingLabels(cr *cachev1alpha1.CustomResource) map[string]string {
+	return map[string]string{
+		"app":    cr.Name,
+		"server": cr.Name,
+	}
+}
+
+func serverLabels(cr *cachev1alpha1.CustomResource) map[string]string {
 	labels := map[string]string{
-		"app": cr.Name,
+		"version": cr.Spec.Version,
 	}
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
-				},
-			},
-		},
+	for k, v := range matchingLabels(cr) {
+		labels[k] = v
 	}
+	return labels
 }
