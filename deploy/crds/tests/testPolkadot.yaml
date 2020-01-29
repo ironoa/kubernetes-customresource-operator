@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polkadot-deployment
+  labels:
+    app: polkadot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: polkadot
+  template:
+    metadata:
+      labels:
+        app: polkadot
+    spec:
+      containers:
+        - name: polkadot
+          image: chevdor/polkadot
+          ports:
+            - containerPort: 30333
+            - containerPort: 9933
+            - containerPort: 9944
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: polkadot-service
+spec:
+  selector:
+    app: polkadot
+  type: NodePort  
+  ports:
+    - protocol: TCP
+      port: 30333
+      targetPort: 30333
+      name: a
+    - protocol: TCP
+      port: 9933
+      targetPort: 9933 
+      name: b
+    - protocol: TCP
+      port: 9944
+      targetPort: 9933  
+      name: c  
