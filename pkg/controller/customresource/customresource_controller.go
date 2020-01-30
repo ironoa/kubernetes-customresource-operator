@@ -2,7 +2,6 @@ package customresource
 
 import (
 	"context"
-
 	"github.com/go-logr/logr"
 	cachev1alpha1 "github.com/ironoa/kubernetes-customresource-operator/pkg/apis/cache/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -43,7 +42,7 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
-	c, err := controller.New("customresource-controller", mgr, controller.Options{Reconciler: r})
+	c, err := controller.New("customresource-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: 1})
 	if err != nil {
 		return err
 	}
@@ -57,6 +56,14 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// TODO(user): Modify this to be the types you create that are owned by the primary resource
 	// Watch for changes to secondary resource Deployments and requeue the owner CustomResource
 	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &cachev1alpha1.CustomResource{},
+	})
+	if err != nil {
+		return err
+	}
+
+	err = c.Watch(&source.Kind{Type: &corev1.Service{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &cachev1alpha1.CustomResource{},
 	})
@@ -87,17 +94,17 @@ func (r *ReconcileCustomResource) Reconcile(request reconcile.Request) (reconcil
 	logger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	logger.Info("Reconciling CustomResource")
 
-	instance, err := r.handleCustomResource(request)
+	handledCRInstance, err := r.handleCustomResource(request)
 	if err != nil {
 		logger.Info("Requeing the Reconciling request... ")
 		return reconcile.Result{}, err
 	}
-	if instance == nil {
+	if handledCRInstance == nil {
 		logger.Info("Return and not requeing the request")
 		return reconcile.Result{}, nil
 	}
 
-	isRequeueForced, err := r.handleDeployment(instance)
+	isRequeueForced, err := r.handleDeployment(handledCRInstance)
 	if err != nil {
 		logger.Info("Requeing the Reconciling request... ")
 		return reconcile.Result{}, err
@@ -107,13 +114,15 @@ func (r *ReconcileCustomResource) Reconcile(request reconcile.Request) (reconcil
 		return reconcile.Result{Requeue: true}, nil
 	}
 
-	/*
-		_, err = r.handleService(instance)
-		if err != nil {
-			logger.Info("Requeing the Reconciling request... ")
-			return reconcile.Result{}, err
-		}
-	*/
+	isRequeueForced, err = r.handleService(handledCRInstance)
+	if err != nil {
+		logger.Info("Requeing the Reconciling request... ")
+		return reconcile.Result{}, err
+	}
+	if isRequeueForced {
+		logger.Info("Requeing the Reconciling request... ")
+		return reconcile.Result{Requeue: true}, nil
+	}
 
 	// more handlers
 
@@ -123,17 +132,17 @@ func (r *ReconcileCustomResource) Reconcile(request reconcile.Request) (reconcil
 func (r *ReconcileCustomResource) handleCustomResource(request reconcile.Request) (*cachev1alpha1.CustomResource, error) {
 	logger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 
-	instance, err := r.fetchCustomResource(request)
+	found, err := r.fetchCustomResource(request)
 	if err != nil {
 		logger.Error(err, "Error on fetch the Custom Resource...")
 		return nil, err
 	}
-	if instance == nil {
+	if found == nil {
 		logger.Info("Custom Resource not found...")
 		return nil, nil
 	}
 
-	return instance, nil
+	return found, nil
 }
 
 func (r *ReconcileCustomResource) fetchCustomResource(request reconcile.Request) (*cachev1alpha1.CustomResource, error) {
@@ -148,21 +157,21 @@ func (r *ReconcileCustomResource) fetchCustomResource(request reconcile.Request)
 	return found, err
 }
 
-func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.CustomResource) (bool, error) {
+func (r *ReconcileCustomResource) handleDeployment(CRInstance *cachev1alpha1.CustomResource) (bool, error) {
 	const NotForcedRequeue = false
 	const ForcedRequeue = true
 
-	desideredDeployment := r.newDeploymentForCR(instance)
-	logger := log.WithValues("Deployment.Namespace", desideredDeployment.Namespace, "Deployment.Name", desideredDeployment.Name)
+	desiredDeployment := r.newDeploymentForCR(CRInstance)
+	logger := log.WithValues("Deployment.Namespace", desiredDeployment.Namespace, "Deployment.Name", desiredDeployment.Name)
 
-	foundDeployment, err := r.fetchDeployment(desideredDeployment)
+	foundDeployment, err := r.fetchDeployment(desiredDeployment)
 	if err != nil {
 		logger.Error(err, "Error on fetch the Deployment...")
 		return NotForcedRequeue, err
 	}
 	if foundDeployment == nil {
 		logger.Info("Deployment not found...")
-		err := r.createDeployment(desideredDeployment, logger)
+		err := r.createDeployment(desiredDeployment, CRInstance, logger)
 		if err != nil {
 			logger.Error(err, "Error on creating a new Deployment...")
 			return NotForcedRequeue, err
@@ -171,8 +180,8 @@ func (r *ReconcileCustomResource) handleDeployment(instance *cachev1alpha1.Custo
 		return ForcedRequeue, nil
 	}
 
-	if areDeploymentsDifferent(foundDeployment, desideredDeployment, logger) {
-		err := r.updateDeployment(desideredDeployment, logger)
+	if areDeploymentsDifferent(foundDeployment, desiredDeployment, logger) {
+		err := r.updateDeployment(desiredDeployment, logger)
 		if err != nil {
 			logger.Error(err, "Update Deployment Error...")
 			return NotForcedRequeue, err
@@ -192,10 +201,19 @@ func (r *ReconcileCustomResource) fetchDeployment(deployment *appsv1.Deployment)
 	return found, err
 }
 
-func (r *ReconcileCustomResource) createDeployment(deployment *appsv1.Deployment, logger logr.Logger) error {
+func (r *ReconcileCustomResource) createDeployment(deployment *appsv1.Deployment, CRInstance *cachev1alpha1.CustomResource, logger logr.Logger) error {
 	logger.Info("Creating a new Deployment...")
-	err := r.client.Create(context.TODO(), deployment)
+	err := r.setOwnership(CRInstance, deployment)
+	if err != nil {
+		logger.Error(err, "Error on setting the ownership...")
+		return err
+	}
+	err = r.client.Create(context.TODO(), deployment)
 	return err
+}
+
+func (r *ReconcileCustomResource) setOwnership(owner metav1.Object, owned metav1.Object) error {
+	return controllerutil.SetControllerReference(owner, owned, r.scheme)
 }
 
 func areDeploymentsDifferent(currentDeployment *appsv1.Deployment, desideredDeployment *appsv1.Deployment, logger logr.Logger) bool {
@@ -234,44 +252,80 @@ func (r *ReconcileCustomResource) updateDeployment(deployment *appsv1.Deployment
 	return r.client.Update(context.TODO(), deployment)
 }
 
-func (r *ReconcileCustomResource) handleService(instance *cachev1alpha1.CustomResource) (*corev1.Service, error) {
-	reqLogger := log.WithValues("Request.Namespace", instance.Namespace, "Request.Name", instance.Name)
+func (r *ReconcileCustomResource) handleService(CRInstance *cachev1alpha1.CustomResource) (bool, error) {
+	const NotForcedRequeue = false
+	const ForcedRequeue = true
 
-	// Define a new Service object
-	service := newServiceForCR(instance)
+	desideredService := r.newServiceForCR(CRInstance)
+	logger := log.WithValues("Service.Namespace", desideredService.Namespace, "Service.Name", desideredService.Name)
 
-	// Set FactorioServer instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, service, r.scheme); err != nil {
-		return nil, err
+	foundService, err := r.fetchService(desideredService)
+	if err != nil {
+		logger.Error(err, "Error on fetch the Service...")
+		return NotForcedRequeue, err
 	}
-
-	// Check if the Service already exists
-	found := &corev1.Service{}
-	err := r.client.Get(context.TODO(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, found)
-	if err == nil {
-		// Service already exists - don't requeue
-		reqLogger.Info("Skip reconcile: Service already exists", "Service.Namespace", found.Namespace, "Service.Name", found.Name)
-		return found, nil
-	} else if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
-		if err := r.client.Create(context.TODO(), service); err != nil {
-			return nil, err
+	if foundService == nil {
+		logger.Info("Service not found...")
+		err := r.createService(desideredService, CRInstance, logger)
+		if err != nil {
+			logger.Error(err, "Error on creating a new Service...")
+			return NotForcedRequeue, err
 		}
-		return service, nil
+		logger.Info("Created the new Service")
+		return ForcedRequeue, nil
 	}
-	return nil, err
+
+	if areServicesDifferent(foundService, desideredService, logger) {
+		err := r.updateService(desideredService, logger)
+		if err != nil {
+			logger.Error(err, "Update Service Error...")
+			return NotForcedRequeue, err
+		}
+		logger.Info("Updated the Service...")
+	}
+
+	return NotForcedRequeue, nil
 }
 
-func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomResource) *appsv1.Deployment {
-	labels := labelsForApp(cr)
-	replicas := cr.Spec.Size
-	version := cr.Spec.Version
-	labelsWithVersion := labelsForAppWithVersion(cr, version)
+func (r *ReconcileCustomResource) fetchService(service *corev1.Service) (*corev1.Service, error) {
+	found := &corev1.Service{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, found)
+	if err != nil && errors.IsNotFound(err) {
+		return nil, nil
+	}
+	return found, err
+}
 
-	deployment := &appsv1.Deployment{
+func (r *ReconcileCustomResource) createService(service *corev1.Service, CRInstance *cachev1alpha1.CustomResource, logger logr.Logger) error {
+	logger.Info("Creating a new Service...")
+	err := r.setOwnership(CRInstance, service)
+	if err != nil {
+		logger.Error(err, "Error on setting the ownership...")
+		return err
+	}
+	return r.client.Create(context.TODO(), service)
+}
+
+func areServicesDifferent(currentService *corev1.Service, desideredService *corev1.Service, logger logr.Logger) bool {
+	result := false
+	return result
+}
+
+func (r *ReconcileCustomResource) updateService(service *corev1.Service, logger logr.Logger) error {
+	logger.Info("Updating the Service...")
+	return r.client.Update(context.TODO(), service)
+}
+
+func (r *ReconcileCustomResource) newDeploymentForCR(CRInstance *cachev1alpha1.CustomResource) *appsv1.Deployment {
+	labels := labelsForApp(CRInstance)
+	replicas := CRInstance.Spec.Size
+	version := CRInstance.Spec.Version
+	labelsWithVersion := labelsForAppWithVersion(CRInstance, version)
+
+	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-deployment",
-			Namespace: cr.Namespace,
+			Name:      CRInstance.Name + "-deployment",
+			Namespace: CRInstance.Namespace,
 			Labels:    labelsWithVersion,
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -287,6 +341,9 @@ func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomRes
 					Containers: []corev1.Container{{
 						Name:  "polkadot",
 						Image: "chevdor/polkadot:" + version,
+						Command: []string{
+							"polkadot", "--name", "Ironoa", "--rpc-external", "--rpc-cors=all",
+						},
 						Ports: []corev1.ContainerPort{
 							{
 								ContainerPort: 30333,
@@ -303,19 +360,13 @@ func (r *ReconcileCustomResource) newDeploymentForCR(cr *cachev1alpha1.CustomRes
 			},
 		},
 	}
-
-	// Set App instance as the owner and controller.
-	// NOTE: calling SetControllerReference, and setting owner references in
-	// general, is important as it allows deleted objects to be garbage collected.
-	controllerutil.SetControllerReference(cr, deployment, r.scheme)
-	return deployment
 }
 
-func newServiceForCR(cr *cachev1alpha1.CustomResource) *corev1.Service {
+func (r *ReconcileCustomResource) newServiceForCR(cr *cachev1alpha1.CustomResource) *corev1.Service {
 	labels := labelsForApp(cr)
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name,
+			Name:      cr.Name + "-service",
 			Namespace: cr.Namespace,
 			Labels:    labels,
 		},
@@ -323,19 +374,19 @@ func newServiceForCR(cr *cachev1alpha1.CustomResource) *corev1.Service {
 			Type: corev1.ServiceTypeNodePort,
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "a",
+					Name:       "to-be-defined-a",
 					Port:       30333,
 					TargetPort: intstr.FromInt(30333),
 					Protocol:   "TCP",
 				},
 				{
-					Name:       "b",
+					Name:       "to-be-defined-b",
 					Port:       9933,
 					TargetPort: intstr.FromInt(9933),
 					Protocol:   "TCP",
 				},
 				{
-					Name:       "c",
+					Name:       "to-be-defined-c",
 					Port:       9944,
 					TargetPort: intstr.FromInt(9944),
 					Protocol:   "TCP",

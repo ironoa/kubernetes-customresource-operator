@@ -1,7 +1,7 @@
 apiVersion: cache.example.com/v1alpha1
 kind: CustomResource
 metadata:
-  name: example-customresource
+  name: polkadot-customresource
 spec:
   # Add fields here
   size: 1

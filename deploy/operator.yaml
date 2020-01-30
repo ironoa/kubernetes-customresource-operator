@@ -16,7 +16,7 @@ spec:
       containers:
         - name: customresource-operator
           # Replace this with the built image name
-          image: ironoa/customresource-operator:v0.0.1
+          image: ironoa/customresource-operator:v0.0.2
           command:
           - customresource-operator
           imagePullPolicy: Always
