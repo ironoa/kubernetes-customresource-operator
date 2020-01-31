@@ -14,9 +14,16 @@ spec:
       labels:
         app: polkadot
     spec:
+      volumes:
+        - name: polkadot-db
+          persistentVolumeClaim:
+            claimName: task-pv-claim
       containers:
         - name: polkadot
           image: chevdor/polkadot
+          volumeMounts:
+            - mountPath: "/data"
+              name: polkadot-db
           ports:
             - containerPort: 30333
             - containerPort: 9933
